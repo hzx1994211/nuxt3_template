@@ -1,1 +1,12 @@
 
+export const isMobile = () => {
+  let userAgent = "";
+  if (import.meta.server) {
+    userAgent = useRequestHeader("user-agent") || "";
+  } else if (import.meta.client) {
+    userAgent = navigator.userAgent;
+  }
+  return /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(
+    userAgent,
+  );
+};
