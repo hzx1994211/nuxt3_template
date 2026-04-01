@@ -91,7 +91,7 @@ function useFetchRequest(method: HttpMethod) {
         const response = await $fetch(requestUrl, {
           method,
           body: params,
-          ...options,
+          //...options,
           onRequest({ options: reqOpts } :any) {
             // 请求拦截：统一添加 headers
             handleReqponse(reqOpts);
