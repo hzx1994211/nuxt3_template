@@ -1,0 +1,275 @@
+import type { UseFetchOptions } from "nuxt/app";
+import { isMobile } from "~/utils";
+
+export interface RequestOptions extends UseFetchOptions<any> {
+  customBaseURL?: string;
+}
+
+type HttpMethod = "GET" | "POST" | "PUT" | "DELETE";
+
+interface ApiResponse<T = any> {
+  code: number;
+  message: string;
+  data: T;
+}
+
+const REFRESH_URL = "/v1/auth/refresh";
+const AUTH_EXPIRED_CODE = 1102;
+
+/**
+ * 刷新状态标记：表示"当前是否有刷新请求正在进行"
+ * true  = 有人正在刷新，后续请求应该挂起等待
+ * false = 没人在刷，下一个请求由自己发起刷新
+ */
+let isRefreshing = false;
+
+/**
+ * 等待队列：存放"挂起的重试任务"的 resolver
+ *
+ * 当有并发请求遇到 1102 但已经有人在刷新时，
+ * 就往队列里塞一个 resolver，自己 await 一个 Promise，
+ * 等刷新的那个人刷完后，把队列里所有 resolver 全部调用，
+ * 让它们拿到新 token 一起醒来去重试。
+ */
+let pendingQueue: Array<(token: string | null) => void> = [];
+
+/**
+ * Token 版本号：每次刷新成功自增一次
+ *
+ * 解决"慢接口重复刷新"问题：
+ *   t0: A、B、C 三个请求都带 v=0 的旧 token 发出
+ *   t1: A、B 响应快，返回 1102 → A 发起刷新 → 成功，tokenVersion 从 0 → 1
+ *   t2: A、B 各自拿新 token 重试成功
+ *   t3: C 的响应才回来，仍是 1102（服务端基于旧 token 判定）
+ *   t4: C 发现 当前 tokenVersion(1) > 自己发请求时记录的 snapshot(0)
+ *       → 说明 token 已被别人刷新过了，直接用 store 里最新 token 重试，
+ *         不再发起一次额外的 refresh 请求
+ *
+ * 每次请求发出前快照当前 tokenVersion，响应 1102 时对比：
+ *   - 版本号没变  → 确实需要刷新（进队列或自己刷）
+ *   - 版本号变了  → 别人已经刷过了，直接用新 token 重试
+ */
+let tokenVersion = 0;
+
+//请求拦截
+function handleReqponse(options: any, lang?: string) {
+  const { token } = useUserStore();
+  options.headers = {
+    "Content-Type": "application/json",
+    "X-Lang": lang ?? "zh",
+    Authorization: `Bearer ${token}`,
+    ...options.headers,
+  };
+}
+
+// 错误码通用提示（1102 交给外层无感刷新处理，这里跳过，避免刷新成功前误弹提示）
+function handleResponse(response: any) {
+  if (!response) return;
+  const { code, message } = response;
+  if (code === 0 || code === AUTH_EXPIRED_CODE) return;
+  if (import.meta.client) {
+    const toast = useToast();
+    toast?.add?.({ title: message ?? "请求失败", color: "error" });
+  }
+}
+
+/**
+ * 真正发起 refresh 请求（直接复用 useFetchPost，走统一请求层）
+ * - refresh 接口的 url === REFRESH_URL，外层 useFetchPost 内部会识别
+ *   并跳过"1102 自动重试"逻辑，不会递归。
+ * - 返回新的 accessToken；失败返回 null，同时清理本地登录态。
+ */
+async function doRefresh(): Promise<string | null> {
+  const { refreshToken, setToken, setRefreshToken, clearLocalAuth } =
+    useUserStore();
+
+  if (!refreshToken) {
+    clearLocalAuth();
+    return null;
+  }
+
+  try {
+    const resp: any = await useFetchPost(REFRESH_URL, { refreshToken });
+    const newAccessToken: string | undefined = resp?.data?.accessToken;
+
+    if (resp?.code === 0 && newAccessToken) {
+      setToken(newAccessToken);
+      if (resp.data.refreshToken) setRefreshToken(resp.data.refreshToken);
+      tokenVersion++;
+      return newAccessToken;
+    }
+
+    // 业务层判定刷新失败（refreshToken 过期 / 被吊销等）
+    clearLocalAuth();
+    return null;
+  } catch {
+    // 网络层异常，同样清理本地
+    clearLocalAuth();
+    return null;
+  }
+}
+
+/**
+ * 无感刷新入口（仅客户端）：用"队列 + 版本号"的方式处理并发 1102
+ *
+ * @param versionSnapshot  该请求发出时快照的 tokenVersion
+ *
+ * 三种路径，按顺序判定：
+ *
+ * ① 版本号已变（versionSnapshot < tokenVersion）
+ *    → 别人已经刷新过了，直接返回 store 里最新的 token，不发新的刷新请求
+ *    → 解决"慢接口在刷新完成后才返回 1102 触发重复刷新"的问题
+ *
+ * ② 有人正在刷新（isRefreshing === true）
+ *    → 把自己挂进 pendingQueue 排队等结果
+ *    → 刷新的那个人完成后会依次唤醒队列里所有人
+ *
+ * ③ 当前空闲，由我发起刷新
+ *    → 置 isRefreshing = true，调用 doRefresh()
+ *    → 完成后唤醒队列里所有等待者，重置 isRefreshing
+ */
+async function handleAuthExpired(
+  versionSnapshot: number,
+): Promise<string | null> {
+  // ① 版本号已变：别人刷新过了，直接用 store 里最新 token
+  if (versionSnapshot < tokenVersion) {
+    const { token } = useUserStore();
+    return token || null;
+  }
+
+  // ② 有人正在刷：排队等结果
+  if (isRefreshing) {
+    return new Promise<string | null>((resolve) => {
+      pendingQueue.push(resolve);
+    });
+  }
+
+  // ③ 我来刷
+  isRefreshing = true;
+  let newToken: string | null = null;
+
+  try {
+    newToken = await doRefresh();
+  } finally {
+    // 不管成功失败，都要唤醒队列里所有等待的请求
+    // - 成功：大家都拿到新 token，各自重试
+    // - 失败：大家都拿到 null，放弃重试，返回原 1102 响应
+    const queue = pendingQueue;
+    pendingQueue = [];
+    queue.forEach((resolve) => resolve(newToken));
+    isRefreshing = false;
+  }
+
+  return newToken;
+}
+
+/**
+ * 創建請求方法
+ * @param method
+ */
+function useFetchRequest(method: HttpMethod) {
+  /**
+   * @param url
+   * @param data
+   * @param isServer  是否服务端渲染
+   */
+  return async (
+    url: string,
+    data?: any,
+    isServer: boolean = false,
+    options: RequestOptions = {},
+  ) => {
+    const config = useRuntimeConfig();
+
+    const { $i18n } = useNuxtApp();
+    const lang = $i18n?.locale?.value;
+
+    const params = {
+      platform: isMobile() ? "h5" : "pc",
+      lang,
+      timeZone: isServer
+        ? "Asia/Shanghai"
+        : Intl.DateTimeFormat().resolvedOptions().timeZone,
+      req: data,
+    };
+
+    const baseURL = import.meta.client
+      ? config.public.apiBase
+      : `${config.public.apiServeUrl}/api`;
+
+    if (isServer) {
+      // SSR 分支：不做无感刷新，遇 1102 由上层页面处理
+      const { ...fetchOptions } = options;
+      const fetchResult: any = useFetch(url, {
+        method,
+        body: params,
+        watch: false,
+        key: `api-${method}-${url}-${JSON.stringify(data)}`,
+        onRequest({ options }: any) {
+          options.baseURL = baseURL;
+          handleReqponse(options, lang);
+        },
+        onResponse({ response }: any) {
+          handleResponse(response._data);
+        },
+        onResponseError({ response }: any) {
+          handleResponse(response._data);
+        },
+        ...fetchOptions,
+      });
+
+      return fetchResult;
+    }
+
+    // 客户端分支：支持无感刷新 + 重试
+    const clientBaseURL = config.public.apiBase as string;
+    const requestUrl = clientBaseURL + url;
+
+    const doFetch = async (): Promise<ApiResponse> =>
+      await $fetch(requestUrl, {
+        method,
+        body: params,
+        onRequest({ options: reqOpts }: any) {
+          handleReqponse(reqOpts, lang);
+        },
+        onResponseError({ response: errRes }: any) {
+          if (import.meta.client) {
+            const toast = useToast();
+            toast?.add?.({
+              orientation: "horizontal",
+              title: errRes?.statusMessage || errRes?.statusText || "请求失败",
+              color: "error",
+            });
+          }
+        },
+      });
+
+    // 快照本次请求发出时的版本号（必须在 doFetch 之前，代表"我用的是哪个 token"）
+    const versionSnapshot = tokenVersion;
+
+    try {
+      let response: ApiResponse = await doFetch();
+
+      // 遇到 token 过期：交给 handleAuthExpired 处理（队列 + 版本号）
+      // refresh 接口本身跳过，避免递归刷新
+      const isRefreshRequest = url === REFRESH_URL;
+      if (response?.code === AUTH_EXPIRED_CODE && !isRefreshRequest) {
+        const newToken = await handleAuthExpired(versionSnapshot);
+        // 拿到新 token（无论是自己刷的还是排队等别人刷的）就用新 token 重试一次
+        if (newToken) {
+          response = await doFetch();
+        }
+      }
+
+      handleResponse(response);
+      return response;
+    } catch (error) {
+      throw error;
+    }
+  };
+}
+
+// export const useFetchGet = useFetchRequest("GET");
+export const useFetchPost = useFetchRequest("POST");
+// export const useFetchPut = useFetchRequest("PUT");
+// export const useFetchDelete = useFetchRequest("DELETE");
